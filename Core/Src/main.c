@@ -41,7 +41,7 @@
 #define LORA_MAX_RETRIES     5
 #define LORA_BAND_MHZ        915
 #define LORA_NETWORK_ID      3
-#define LORA_ADDRESS         4
+#define LORA_ADDRESS         1
 #define LORA_DEST_ADDRESS    0
 #define LORA_RF_POWER        14
 
@@ -544,6 +544,155 @@ static uint8_t lora_send_with_ack(const char *hex_payload, uint16_t payload_byte
     return 0;
 }
 
+/* ======== LoRa async TX state machine (Step 2) ========
+ * Replaces the blocking 5x10s wait inside lora_send_with_ack with a
+ * non-blocking state machine driven by lora_tick() from the main loop.
+ * On-the-wire behavior is identical: same +SEND format, same retry count,
+ * same ACK timeout, same 200ms inter-attempt backoff, same
+ * g_seq_bit-toggles-on-ACK rule. The difference is that the main loop is
+ * free to run gps_try_read() (and, later, beacon / forwarding logic)
+ * while we wait. Callers must gate new sends on lora_is_busy() == 0.
+ */
+
+typedef enum {
+    LORA_TX_IDLE     = 0,
+    LORA_TX_WAIT_ACK = 1,
+    LORA_TX_BACKOFF  = 2
+} lora_tx_state_t;
+
+static lora_tx_state_t g_tx_state   = LORA_TX_IDLE;
+static char            g_tx_hex[64];      /* 22-byte BASE packet = 44 hex chars + nul */
+static uint8_t         g_tx_attempt = 0;
+static uint32_t        g_tx_t0      = 0;  /* attempt-start (WAIT_ACK) or backoff-start (BACKOFF) */
+static uint8_t         g_tx_last_ok = 0;  /* result of most recent completed send */
+
+/* Independent line accumulator for the async path. Safe because lora_cmd()
+ * (the only other ring consumer) runs only during init, before the main
+ * loop begins ticking. */
+static char     lora_line_buf[128];
+static uint16_t lora_line_idx = 0;
+
+static uint16_t lora_readline_nb(char **out)
+{
+    uint8_t b;
+    while (lora_rx_pop(&b)) {
+        if (b == '\n') {
+            if (lora_line_idx > 0 && lora_line_buf[lora_line_idx - 1] == '\r')
+                lora_line_idx--;
+            lora_line_buf[lora_line_idx] = '\0';
+            *out = lora_line_buf;
+            uint16_t len = lora_line_idx;
+            lora_line_idx = 0;
+            return len;
+        }
+        if (lora_line_idx < sizeof(lora_line_buf) - 1) {
+            lora_line_buf[lora_line_idx++] = (char)b;
+        } else {
+            lora_line_idx = 0;   /* overflow — discard partial line */
+        }
+    }
+    return 0;
+}
+
+static void lora_tx_transmit_current(void)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "AT+SEND=%d,%d,%s\r\n",
+             LORA_DEST_ADDRESS, (int)strlen(g_tx_hex), g_tx_hex);
+    HAL_UART_Transmit(&huart1, (uint8_t *)cmd, (uint16_t)strlen(cmd), LORA_CMD_TIMEOUT_MS);
+    g_tx_t0    = HAL_GetTick();
+    g_tx_state = LORA_TX_WAIT_ACK;
+}
+
+static uint8_t lora_is_busy(void)
+{
+    return (uint8_t)(g_tx_state != LORA_TX_IDLE);
+}
+
+static uint8_t lora_send_begin(const char *hex_payload, uint16_t payload_byte_len)
+{
+    (void)payload_byte_len;
+    if (g_tx_state != LORA_TX_IDLE) return 0;
+    size_t n = strlen(hex_payload);
+    if (n + 1 > sizeof(g_tx_hex)) return 0;
+    memcpy(g_tx_hex, hex_payload, n + 1);
+    g_tx_attempt = 0;
+    g_tx_last_ok = 0;
+    lora_tx_transmit_current();
+    return 1;
+}
+
+static void lora_tick(void)
+{
+    /* drain all complete lines from the ring this tick */
+    char    *line;
+    uint16_t llen;
+    while ((llen = lora_readline_nb(&line)) > 0) {
+        if (g_tx_state != LORA_TX_WAIT_ACK) continue;
+        if (strncmp(line, "+RCV=", 5) != 0)  continue;
+
+        char tmp[128];
+        strncpy(tmp, line + 5, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+
+        char *tok = strtok(tmp, ",");        /* src_addr     */
+        if (!tok) continue;
+        tok       = strtok(NULL, ",");        /* declared len */
+        if (!tok) continue;
+        tok       = strtok(NULL, ",");        /* hex payload  */
+        if (!tok) continue;
+
+        uint8_t reply[16];
+        uint8_t nbytes = hex_str_to_bytes(tok, reply, sizeof(reply));
+        if (nbytes < 9) continue;
+
+        uint16_t crc_calc = crc16_ccitt(reply, (uint16_t)(nbytes - 2));
+        uint16_t crc_recv = (uint16_t)(reply[nbytes - 2] | ((uint16_t)reply[nbytes - 1] << 8));
+        if (crc_calc != crc_recv) continue;
+
+        uint8_t rcv_seq = reply[2] & 0x0F;
+        int32_t message;
+        memcpy(&message, &reply[3], 4);
+        if (rcv_seq != g_seq_bit) continue;
+
+        if (message == ACK_MSG) {
+            g_seq_bit   ^= 1u;
+            g_tx_last_ok = 1;
+            g_tx_state   = LORA_TX_IDLE;
+            return;
+        }
+        if (message == NACK_MSG) {
+            g_tx_attempt++;
+            if (g_tx_attempt >= LORA_MAX_RETRIES) {
+                g_tx_last_ok = 0;
+                g_tx_state   = LORA_TX_IDLE;
+            } else {
+                g_tx_t0    = HAL_GetTick();
+                g_tx_state = LORA_TX_BACKOFF;
+            }
+            return;
+        }
+    }
+
+    /* timing-driven transitions */
+    if (g_tx_state == LORA_TX_BACKOFF) {
+        if ((HAL_GetTick() - g_tx_t0) >= 200u) {
+            lora_tx_transmit_current();
+        }
+    } else if (g_tx_state == LORA_TX_WAIT_ACK) {
+        if ((HAL_GetTick() - g_tx_t0) >= (uint32_t)LORA_ACK_TIMEOUT_MS) {
+            g_tx_attempt++;
+            if (g_tx_attempt >= LORA_MAX_RETRIES) {
+                g_tx_last_ok = 0;
+                g_tx_state   = LORA_TX_IDLE;
+            } else {
+                g_tx_t0    = HAL_GetTick();
+                g_tx_state = LORA_TX_BACKOFF;
+            }
+        }
+    }
+}
+
 /* Pack and transmit a LOCATION packet (13 bytes).
    Sent only when a valid GPS fix is available. */
 static void send_location_packet(void)
@@ -564,7 +713,7 @@ static void send_location_packet(void)
     pkt[12] = (uint8_t)(crc >> 8);
 
     bytes_to_hex_str(pkt, 13, hex);
-    lora_send_with_ack(hex, 13);
+    lora_send_begin(hex, 13);
 }
 
 /* Pack and transmit a BASE sensor packet (22 bytes). */
@@ -594,7 +743,7 @@ static void send_base_packet(float temp_c, float hum_rh, float press_hpa,
     pkt[21] = (uint8_t)(crc >> 8);
 
     bytes_to_hex_str(pkt, 22, hex);
-    lora_send_with_ack(hex, 22);
+    lora_send_begin(hex, 22);
 }
 
 /* ======== clock ======== */
@@ -702,18 +851,19 @@ int main(void)
     while (1) {
         /* opportunistically grab a GPS fix from USART3 */
         gps_try_read();
+        lora_tick();
 
         uint32_t now = HAL_GetTick();
 
         /* send GPS location packet every LOCATION_PERIOD_MS (only when fix valid) */
-        if ((now - last_location) >= LOCATION_PERIOD_MS) {
+        if (!lora_is_busy() && (now - last_location) >= LOCATION_PERIOD_MS) {
             last_location += LOCATION_PERIOD_MS;
             //if (g_gps_valid) //ML: i commented this out
             send_location_packet();
         }
 
         /* send sensor BASE packet every SEND_PERIOD_MS */
-        if ((now - last_send) >= SEND_PERIOD_MS) {
+        if (!lora_is_busy() && (now - last_send) >= SEND_PERIOD_MS) {
             last_send += SEND_PERIOD_MS;
 
             uint8_t ok_bme = 0, ok_co = 0, ok_co2 = 0;
