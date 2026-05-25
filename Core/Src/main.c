@@ -63,6 +63,14 @@
 #define ACK_MSG              1
 #define NACK_MSG             0
 
+/* Step 3: expanded-header packet types and TTL.
+ * PKT_TYPE_ACK aliases PKT_TYPE_REPLY (same value 0x02) — both names compile,
+ * dead lora_send_with_ack keeps using ACK_MSG/NACK_MSG/PKT_TYPE_REPLY. */
+#define PKT_TYPE_ACK         0x02       /* hub -> originator (success)   */
+#define PKT_TYPE_NACK        0x03       /* hub -> originator (CRC fail)  */
+#define PKT_TYPE_BEACON      0x04       /* Step 5 placeholder            */
+#define LORA_INITIAL_TTL     4
+
 /* ======== BME280 calibration ======== */
 typedef struct {
     uint16_t dig_T1; int16_t  dig_T2; int16_t  dig_T3;
@@ -92,6 +100,7 @@ static float   g_gps_lat   = 0.0f;
 static uint8_t g_gps_valid = 0;
 
 static uint8_t g_seq_bit = 0;
+static uint16_t g_pkt_id = 0;   /* Step 3: per-originator pkt_id, increments on ACK success */
 
 /* ======== LoRa IRQ-driven RX ring buffer (Step 1) ========
  * Single-producer (USART1 ISR via HAL_UART_RxCpltCallback) /
@@ -650,18 +659,23 @@ static void lora_tick(void)
         uint16_t crc_recv = (uint16_t)(reply[nbytes - 2] | ((uint16_t)reply[nbytes - 1] << 8));
         if (crc_calc != crc_recv) continue;
 
-        uint8_t rcv_seq = reply[2] & 0x0F;
-        int32_t message;
-        memcpy(&message, &reply[3], 4);
-        if (rcv_seq != g_seq_bit) continue;
+        /* Step 3 ACK layout: originator(1) | final_dest(1) | prev_hop(1) |
+         * next_hop(1) | type/ttl(1) | pkt_id(2) | crc(2). Same 9 bytes total
+         * as the old reply, completely different field layout. */
+        uint8_t  ack_originator = reply[0];
+        uint8_t  ack_type       = (reply[4] >> 4) & 0x0F;
+        uint16_t ack_pkt_id;
+        memcpy(&ack_pkt_id, &reply[5], 2);
+        if (ack_originator != LORA_ADDRESS) continue;
+        if (ack_pkt_id     != g_pkt_id)     continue;
 
-        if (message == ACK_MSG) {
-            g_seq_bit   ^= 1u;
+        if (ack_type == PKT_TYPE_ACK) {
+            g_pkt_id++;
             g_tx_last_ok = 1;
             g_tx_state   = LORA_TX_IDLE;
             return;
         }
-        if (message == NACK_MSG) {
+        if (ack_type == PKT_TYPE_NACK) {
             g_tx_attempt++;
             if (g_tx_attempt >= LORA_MAX_RETRIES) {
                 g_tx_last_ok = 0;
@@ -697,31 +711,34 @@ static void lora_tick(void)
    Sent only when a valid GPS fix is available. */
 static void send_location_packet(void)
 {
-    uint8_t  pkt[13];
-    char     hex[27];
+    uint8_t  pkt[17];
+    char     hex[35];
     int32_t  lon_i = (int32_t)(g_gps_lon * 100000.0f);
     int32_t  lat_i = (int32_t)(g_gps_lat * 100000.0f);
     uint16_t crc;
 
-    pkt[0] = (uint8_t)LORA_ADDRESS;
-    pkt[1] = (uint8_t)LORA_DEST_ADDRESS;
-    pkt[2] = (uint8_t)((PKT_TYPE_DATA << 4) | (g_seq_bit & 0x0F));
-    memcpy(&pkt[3], &lon_i, 4);
-    memcpy(&pkt[7], &lat_i, 4);
-    crc    = crc16_ccitt(pkt, 11);
-    pkt[11] = (uint8_t)(crc & 0xFF);
-    pkt[12] = (uint8_t)(crc >> 8);
+    pkt[0] = (uint8_t)LORA_ADDRESS;        /* originator */
+    pkt[1] = (uint8_t)LORA_DEST_ADDRESS;   /* final_dest */
+    pkt[2] = (uint8_t)LORA_ADDRESS;        /* prev_hop   */
+    pkt[3] = (uint8_t)LORA_DEST_ADDRESS;   /* next_hop   */
+    pkt[4] = (uint8_t)((PKT_TYPE_DATA << 4) | (LORA_INITIAL_TTL & 0x0F));
+    memcpy(&pkt[5],  &g_pkt_id, 2);
+    memcpy(&pkt[7],  &lon_i,    4);
+    memcpy(&pkt[11], &lat_i,    4);
+    crc     = crc16_ccitt(pkt, 15);
+    pkt[15] = (uint8_t)(crc & 0xFF);
+    pkt[16] = (uint8_t)(crc >> 8);
 
-    bytes_to_hex_str(pkt, 13, hex);
-    lora_send_begin(hex, 13);
+    bytes_to_hex_str(pkt, 17, hex);
+    lora_send_begin(hex, 17);
 }
 
 /* Pack and transmit a BASE sensor packet (22 bytes). */
 static void send_base_packet(float temp_c, float hum_rh, float press_hpa,
                               float co_ppm, uint16_t co2_ppm)
 {
-    uint8_t  pkt[22];
-    char     hex[45];
+    uint8_t  pkt[26];
+    char     hex[53];
     int16_t  temp_i  = (int16_t)(temp_c    * 100.0f);
     int16_t  hum_i   = (int16_t)(hum_rh    * 100.0f);
     int32_t  pres_i  = (int32_t)(press_hpa * 100.0f);
@@ -729,21 +746,24 @@ static void send_base_packet(float temp_c, float hum_rh, float press_hpa,
     int32_t  co2_i   = (int32_t)co2_ppm * 100;
     uint16_t crc;
 
-    pkt[0]  = (uint8_t)LORA_ADDRESS;
-    pkt[1]  = (uint8_t)LORA_DEST_ADDRESS;
-    pkt[2]  = (uint8_t)((PKT_TYPE_DATA << 4) | (g_seq_bit & 0x0F));
-    memcpy(&pkt[3],  &temp_i, 2);
-    memcpy(&pkt[5],  &hum_i,  2);
-    memcpy(&pkt[7],  &pres_i, 4);
-    memcpy(&pkt[11], &co_i,   4);
-    memcpy(&pkt[15], &co2_i,  4);
-    pkt[19] = 0x00;                 /* fire_u8 = 0 (predicted by hub) */
-    crc     = crc16_ccitt(pkt, 20);
-    pkt[20] = (uint8_t)(crc & 0xFF);
-    pkt[21] = (uint8_t)(crc >> 8);
+    pkt[0]  = (uint8_t)LORA_ADDRESS;        /* originator */
+    pkt[1]  = (uint8_t)LORA_DEST_ADDRESS;   /* final_dest */
+    pkt[2]  = (uint8_t)LORA_ADDRESS;        /* prev_hop   */
+    pkt[3]  = (uint8_t)LORA_DEST_ADDRESS;   /* next_hop   */
+    pkt[4]  = (uint8_t)((PKT_TYPE_DATA << 4) | (LORA_INITIAL_TTL & 0x0F));
+    memcpy(&pkt[5],  &g_pkt_id, 2);
+    memcpy(&pkt[7],  &temp_i,   2);
+    memcpy(&pkt[9],  &hum_i,    2);
+    memcpy(&pkt[11], &pres_i,   4);
+    memcpy(&pkt[15], &co_i,     4);
+    memcpy(&pkt[19], &co2_i,    4);
+    pkt[23] = 0x00;                 /* fire_u8 = 0 (predicted by hub) */
+    crc     = crc16_ccitt(pkt, 24);
+    pkt[24] = (uint8_t)(crc & 0xFF);
+    pkt[25] = (uint8_t)(crc >> 8);
 
-    bytes_to_hex_str(pkt, 22, hex);
-    lora_send_begin(hex, 22);
+    bytes_to_hex_str(pkt, 26, hex);
+    lora_send_begin(hex, 26);
 }
 
 /* ======== clock ======== */
