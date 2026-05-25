@@ -41,7 +41,7 @@
 #define LORA_MAX_RETRIES     5
 #define LORA_BAND_MHZ        915
 #define LORA_NETWORK_ID      3
-#define LORA_ADDRESS         1
+#define LORA_ADDRESS         4
 #define LORA_DEST_ADDRESS    0
 #define LORA_RF_POWER        14
 
@@ -92,6 +92,22 @@ static float   g_gps_lat   = 0.0f;
 static uint8_t g_gps_valid = 0;
 
 static uint8_t g_seq_bit = 0;
+
+/* ======== LoRa IRQ-driven RX ring buffer (Step 1) ========
+ * Single-producer (USART1 ISR via HAL_UART_RxCpltCallback) /
+ * single-consumer (main thread via lora_rx_pop).
+ * head/tail are volatile uint16_t — single-word access is atomic on
+ * Cortex-M4 so no critical section is needed for SPSC.
+ */
+#define LORA_RX_RING_SIZE    256u
+#define LORA_RX_RING_MASK    (LORA_RX_RING_SIZE - 1u)
+
+static volatile uint8_t  lora_rx_ring[LORA_RX_RING_SIZE];
+static volatile uint16_t lora_rx_head = 0;   /* written by ISR  */
+static volatile uint16_t lora_rx_tail = 0;   /* written by main */
+static uint8_t           lora_rx_byte = 0;   /* HAL single-byte landing pad */
+
+/* ======== SenseAir S88 — now on huart2 (USART2, PA2/PA3) ======== */
 
 /* ======== SenseAir S88 — now on huart2 (USART2, PA2/PA3) ======== */
 static uint16_t s88_crc16(const uint8_t *data, uint8_t len)
@@ -389,6 +405,45 @@ static void gps_try_read(void)
     g_gps_valid = 1;
 }
 
+/* ======== LoRa IRQ-driven RX helpers (Step 1) ======== */
+
+/* Non-blocking ring buffer pop. Returns 1 if a byte was available, else 0. */
+static uint8_t lora_rx_pop(uint8_t *out)
+{
+    if (lora_rx_head == lora_rx_tail) return 0;
+    *out = lora_rx_ring[lora_rx_tail];
+    lora_rx_tail = (uint16_t)((lora_rx_tail + 1u) & LORA_RX_RING_MASK);
+    return 1;
+}
+
+/* HAL RX-complete callback: byte arrived on USART1, push to ring and re-arm.
+ * Scoped to USART1 only; does not affect huart2 (S88) or huart3 (GPS/CO) polled paths.
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART1) return;
+
+    uint16_t next = (uint16_t)((lora_rx_head + 1u) & LORA_RX_RING_MASK);
+    if (next != lora_rx_tail) {                  /* drop byte if ring full */
+        lora_rx_ring[lora_rx_head] = lora_rx_byte;
+        lora_rx_head = next;
+    }
+    (void)HAL_UART_Receive_IT(huart, &lora_rx_byte, 1);
+}
+
+/* HAL RX-error callback: overrun is common at 115200; clear flags and re-arm.
+ * Only handles USART1; s88_uart_clear_errors() handles huart2 inline as before.
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART1) return;
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_PEFLAG(huart);
+    (void)HAL_UART_Receive_IT(huart, &lora_rx_byte, 1);
+}
+
 /* ======== LoRa — now on huart1 (USART1, PB6/PB7) ======== */
 static void lora_cmd(const char *cmd, uint32_t timeout_ms)
 {
@@ -399,7 +454,7 @@ static void lora_cmd(const char *cmd, uint32_t timeout_ms)
     uint32_t t0 = HAL_GetTick();
     while ((HAL_GetTick() - t0) < timeout_ms && i < sizeof(rx) - 1) {
         uint8_t c;
-        if (HAL_UART_Receive(&huart1, &c, 1, 10) == HAL_OK) rx[i++] = c;
+        if (lora_rx_pop(&c)) rx[i++] = c;
     }
 }
 
@@ -409,7 +464,7 @@ static uint16_t lora_readline(char *buf, uint16_t buf_size, uint32_t timeout_ms)
     uint32_t t0  = HAL_GetTick();
     while ((HAL_GetTick() - t0) < timeout_ms && idx < buf_size - 1) {
         uint8_t b;
-        if (HAL_UART_Receive(&huart1, &b, 1, 5) != HAL_OK) continue;
+        if (!lora_rx_pop(&b)) continue;
         if (b == '\n') {
             if (idx > 0 && buf[idx - 1] == '\r') idx--;
             break;
@@ -618,6 +673,10 @@ int main(void)
     huart3.Init.OneBitSampling        = UART_ONE_BIT_SAMPLE_DISABLE;
     huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
     HAL_UART_Init(&huart3);
+
+    /* Step 1: arm IRQ-driven single-byte RX for LoRa.
+     * MspInit (called from HAL_UART_Init above) has already enabled the USART1 NVIC line. */
+    HAL_UART_Receive_IT(&huart1, &lora_rx_byte, 1);
 
     HAL_Delay(1000);
 
