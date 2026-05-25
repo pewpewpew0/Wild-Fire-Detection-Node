@@ -1,0 +1,13 @@
+!SESSION 2026-05-08 09:56:15.028 -----------------------------------------------
+eclipse.buildId=Version 2.1.1
+java.version=21.0.9
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=macosx, ARCH=x86_64, WS=cocoa, NL=en_OM
+Framework arguments:  -keyring /Users/mannylemus/.eclipse_keyring
+Command-line arguments:  -os macosx -ws cocoa -arch x86_64 -keyring /Users/mannylemus/.eclipse_keyring
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-05-08 09:56:48.763
+!MESSAGE Log4j2 initialized with config file /Users/mannylemus/STM32CubeIDE/workspace_1.19.0/WFD_Node/.metadata/.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-05-08 09:56:53.240
+!MESSAGE Started RMI Server, listening on port 41337
