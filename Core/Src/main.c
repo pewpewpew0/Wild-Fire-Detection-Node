@@ -41,9 +41,13 @@
 #define LORA_MAX_RETRIES     5
 #define LORA_BAND_MHZ        915
 #define LORA_NETWORK_ID      3
-#define LORA_ADDRESS         1
+#define LORA_ADDRESS         3
 #define LORA_DEST_ADDRESS    0
-#define LORA_RF_POWER        14
+#define MY_PARENT_ADDRESS    0          /* Step 4: next-hop toward sink. Edit per node.
+                                         * Node A (leaf):      LORA_ADDRESS=1, MY_PARENT_ADDRESS=2
+                                         * Node B (forwarder): LORA_ADDRESS=2, MY_PARENT_ADDRESS=0
+                                         * Node C (leaf):      LORA_ADDRESS=3, MY_PARENT_ADDRESS=2 */
+#define LORA_RF_POWER        22
 
 /* BME280 (I2C1, hi2c1, PB8/PB9) */
 #define BME280_I2C_ADDR      (0x76 << 1)
@@ -575,6 +579,47 @@ static uint8_t         g_tx_attempt = 0;
 static uint32_t        g_tx_t0      = 0;  /* attempt-start (WAIT_ACK) or backoff-start (BACKOFF) */
 static uint8_t         g_tx_last_ok = 0;  /* result of most recent completed send */
 
+/* Step 4: per-pending metadata. Set by lora_send_begin, used by lora_tick to
+ * match incoming ACK/NACK and to decide whether to increment g_pkt_id (own
+ * send) or relay the ACK downstream (forwarded send). */
+static uint8_t  g_tx_originator = 0;
+static uint16_t g_tx_pkt_id     = 0;
+static uint8_t  g_tx_is_own     = 0;     /* 1 = our own data, 0 = forwarding for someone */
+static uint8_t  g_tx_next_hop   = 0;     /* AT+SEND destination (overrides LORA_DEST_ADDRESS) */
+
+/* Step 4 forwarding-state cache: (originator, pkt_id) -> prev_hop, with ~30s
+ * TTL. Used both for relaying ACKs back along the reverse path and for
+ * deduplicating DATA retransmits from a child. */
+#define FWD_CACHE_SIZE       8u
+#define FWD_CACHE_TTL_MS     30000u
+
+/* Step 4 cache states: PENDING = forward in flight, CONFIRMED = upstream
+ * has acked, downstream ACK is safe to re-send from cache on a dup DATA.
+ * OBSERVED = we've heard the originator broadcasting this pkt_id but
+ * have not relayed yet — the originator may be reaching the hub
+ * directly, so we don't add extra traffic until enough retries confirm
+ * the direct path is failing. */
+#define FWD_STATE_PENDING    0u
+#define FWD_STATE_CONFIRMED  1u
+#define FWD_STATE_OBSERVED   2u
+
+/* Cooperative-relay threshold: step in as a forwarder only after hearing
+ * this many direct broadcasts of the same (originator, pkt_id) — that's
+ * the signal the originator can't reach the hub on its own. */
+#define RELAY_HEARD_THRESHOLD 3u
+
+typedef struct {
+    uint8_t  originator;
+    uint16_t pkt_id;
+    uint8_t  prev_hop;
+    uint8_t  state;       /* FWD_STATE_OBSERVED, PENDING, or CONFIRMED */
+    uint8_t  heard_count; /* incremented each time we hear this (orig, pkt_id) */
+    uint32_t ts_ms;
+    uint8_t  valid;
+} fwd_entry_t;
+
+static fwd_entry_t fwd_cache[FWD_CACHE_SIZE];
+
 /* Independent line accumulator for the async path. Safe because lora_cmd()
  * (the only other ring consumer) runs only during init, before the main
  * loop begins ticking. */
@@ -603,11 +648,133 @@ static uint16_t lora_readline_nb(char **out)
     return 0;
 }
 
+/* Step 4 forwarding cache helpers. Linear scan; size is 8 so cost is trivial. */
+/* Step 4 forwarding cache helpers. Linear scan; size is 8 so cost is trivial.
+ * fwd_lookup returns a pointer so the caller can read prev_hop and state
+ * together, and mutate state in place. Auto-refreshes timestamp on hit so an
+ * active conversation keeps the entry alive. */
+static fwd_entry_t *fwd_lookup(uint8_t originator, uint16_t pkt_id)
+{
+    uint32_t now = HAL_GetTick();
+    for (uint8_t i = 0; i < FWD_CACHE_SIZE; i++) {
+        if (!fwd_cache[i].valid) continue;
+        if ((now - fwd_cache[i].ts_ms) >= FWD_CACHE_TTL_MS) {
+            fwd_cache[i].valid = 0;            /* lazy expiry */
+            continue;
+        }
+        if (fwd_cache[i].originator == originator && fwd_cache[i].pkt_id == pkt_id) {
+            fwd_cache[i].ts_ms = now;          /* refresh on access */
+            return &fwd_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void fwd_insert(uint8_t originator, uint16_t pkt_id, uint8_t prev_hop, uint8_t state)
+{
+    uint32_t now = HAL_GetTick();
+
+    /* Refresh existing entry if any (e.g. PENDING insert when one already exists). */
+    for (uint8_t i = 0; i < FWD_CACHE_SIZE; i++) {
+        if (fwd_cache[i].valid
+            && fwd_cache[i].originator == originator
+            && fwd_cache[i].pkt_id == pkt_id) {
+            fwd_cache[i].prev_hop = prev_hop;
+            fwd_cache[i].state    = state;
+            fwd_cache[i].ts_ms    = now;
+            return;
+        }
+    }
+
+    /* Find an empty or lazily-expired slot. */
+    for (uint8_t i = 0; i < FWD_CACHE_SIZE; i++) {
+        if (!fwd_cache[i].valid
+            || (now - fwd_cache[i].ts_ms) >= FWD_CACHE_TTL_MS) {
+            fwd_cache[i].originator = originator;
+            fwd_cache[i].pkt_id     = pkt_id;
+            fwd_cache[i].prev_hop   = prev_hop;
+            fwd_cache[i].state      = state;
+            fwd_cache[i].ts_ms      = now;
+            fwd_cache[i].valid      = 1;
+            return;
+        }
+    }
+
+    /* Cache full and nothing expired — evict the oldest. */
+    uint8_t  oldest_idx = 0;
+    uint32_t oldest_age = 0;
+    for (uint8_t i = 0; i < FWD_CACHE_SIZE; i++) {
+        uint32_t age = now - fwd_cache[i].ts_ms;
+        if (age > oldest_age) { oldest_age = age; oldest_idx = i; }
+    }
+    fwd_cache[oldest_idx].originator = originator;
+    fwd_cache[oldest_idx].pkt_id     = pkt_id;
+    fwd_cache[oldest_idx].prev_hop   = prev_hop;
+    fwd_cache[oldest_idx].state      = state;
+    fwd_cache[oldest_idx].ts_ms      = now;
+    fwd_cache[oldest_idx].valid      = 1;
+}
+
+static void fwd_remove(uint8_t originator, uint16_t pkt_id)
+{
+    for (uint8_t i = 0; i < FWD_CACHE_SIZE; i++) {
+        if (fwd_cache[i].valid
+            && fwd_cache[i].originator == originator
+            && fwd_cache[i].pkt_id == pkt_id) {
+            fwd_cache[i].valid = 0;
+            return;
+        }
+    }
+}
+
+/* Record a direct-from-originator hearing of (originator, pkt_id). On
+ * the first observation, insert a new OBSERVED entry with heard_count=1.
+ * On subsequent observations, increment heard_count (capped at 0xFF).
+ * Returns the entry so the caller can read heard_count and decide
+ * whether to promote to PENDING and relay. */
+static fwd_entry_t *fwd_observe(uint8_t originator, uint16_t pkt_id, uint8_t prev_hop)
+{
+    uint32_t now = HAL_GetTick();
+
+    for (uint8_t i = 0; i < FWD_CACHE_SIZE; i++) {
+        if (fwd_cache[i].valid
+            && fwd_cache[i].originator == originator
+            && fwd_cache[i].pkt_id == pkt_id) {
+            if (fwd_cache[i].heard_count < 0xFF) fwd_cache[i].heard_count++;
+            fwd_cache[i].ts_ms = now;
+            return &fwd_cache[i];
+        }
+    }
+
+    /* New entry: find empty/expired slot, else evict the oldest. */
+    uint8_t  target = 0;
+    uint32_t oldest_age = 0;
+    for (uint8_t i = 0; i < FWD_CACHE_SIZE; i++) {
+        if (!fwd_cache[i].valid
+            || (now - fwd_cache[i].ts_ms) >= FWD_CACHE_TTL_MS) {
+            target = i;
+            oldest_age = 0xFFFFFFFFu;
+            break;
+        }
+        uint32_t age = now - fwd_cache[i].ts_ms;
+        if (age > oldest_age) { oldest_age = age; target = i; }
+    }
+
+    fwd_cache[target].originator  = originator;
+    fwd_cache[target].pkt_id      = pkt_id;
+    fwd_cache[target].prev_hop    = prev_hop;
+    fwd_cache[target].state       = FWD_STATE_OBSERVED;
+    fwd_cache[target].heard_count = 1;
+    fwd_cache[target].ts_ms       = now;
+    fwd_cache[target].valid       = 1;
+    return &fwd_cache[target];
+}
+
 static void lora_tx_transmit_current(void)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "AT+SEND=%d,%d,%s\r\n",
-             LORA_DEST_ADDRESS, (int)strlen(g_tx_hex), g_tx_hex);
+             g_tx_next_hop, (int)strlen(g_tx_hex), g_tx_hex);
     HAL_UART_Transmit(&huart1, (uint8_t *)cmd, (uint16_t)strlen(cmd), LORA_CMD_TIMEOUT_MS);
     g_tx_t0    = HAL_GetTick();
     g_tx_state = LORA_TX_WAIT_ACK;
@@ -618,17 +785,56 @@ static uint8_t lora_is_busy(void)
     return (uint8_t)(g_tx_state != LORA_TX_IDLE);
 }
 
-static uint8_t lora_send_begin(const char *hex_payload, uint16_t payload_byte_len)
+static uint8_t lora_send_begin(const char *hex_payload, uint16_t payload_byte_len,
+                               uint8_t next_hop, uint8_t originator,
+                               uint16_t pkt_id, uint8_t is_own)
 {
     (void)payload_byte_len;
     if (g_tx_state != LORA_TX_IDLE) return 0;
     size_t n = strlen(hex_payload);
     if (n + 1 > sizeof(g_tx_hex)) return 0;
     memcpy(g_tx_hex, hex_payload, n + 1);
-    g_tx_attempt = 0;
-    g_tx_last_ok = 0;
+    g_tx_attempt    = 0;
+    g_tx_last_ok    = 0;
+    g_tx_next_hop   = next_hop;
+    g_tx_originator = originator;
+    g_tx_pkt_id     = pkt_id;
+    g_tx_is_own     = is_own;
     lora_tx_transmit_current();
     return 1;
+}
+
+/* Step 4 fire-and-forget transmit, used only for relaying ACKs to a child.
+ * No state machine, no retry — if the ACK is lost on the last hop, the
+ * originator's DATA retransmit re-triggers the whole sequence. */
+static void lora_send_fire_and_forget(const char *hex_payload, uint8_t next_hop)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "AT+SEND=%d,%d,%s\r\n",
+             next_hop, (int)strlen(hex_payload), hex_payload);
+    HAL_UART_Transmit(&huart1, (uint8_t *)cmd, (uint16_t)strlen(cmd), LORA_CMD_TIMEOUT_MS);
+}
+
+/* Step 4: send a downstream ACK on behalf of a confirmed flow. Generated
+ * locally from cached information — no relay across the mesh. Called when
+ * an upstream ACK confirms our pending forward, and again on any duplicate
+ * DATA that arrives while the entry is CONFIRMED. */
+static void send_link_ack(uint8_t originator, uint16_t pkt_id, uint8_t to)
+{
+    uint8_t ack[9];
+    ack[0] = originator;                         /* originator (data flow)  */
+    ack[1] = originator;                         /* final_dest = originator */
+    ack[2] = (uint8_t)LORA_ADDRESS;              /* prev_hop = me           */
+    ack[3] = to;                                  /* next_hop = downstream   */
+    ack[4] = (uint8_t)((PKT_TYPE_ACK << 4) | (LORA_INITIAL_TTL & 0x0F));
+    memcpy(&ack[5], &pkt_id, 2);
+    uint16_t crc = crc16_ccitt(ack, 7);
+    ack[7] = (uint8_t)(crc & 0xFF);
+    ack[8] = (uint8_t)(crc >> 8);
+
+    char hex[19];
+    bytes_to_hex_str(ack, 9, hex);
+    lora_send_fire_and_forget(hex, to);
 }
 
 static void lora_tick(void)
@@ -637,7 +843,6 @@ static void lora_tick(void)
     char    *line;
     uint16_t llen;
     while ((llen = lora_readline_nb(&line)) > 0) {
-        if (g_tx_state != LORA_TX_WAIT_ACK) continue;
         if (strncmp(line, "+RCV=", 5) != 0)  continue;
 
         char tmp[128];
@@ -651,7 +856,7 @@ static void lora_tick(void)
         tok       = strtok(NULL, ",");        /* hex payload  */
         if (!tok) continue;
 
-        uint8_t reply[16];
+        uint8_t reply[32];
         uint8_t nbytes = hex_str_to_bytes(tok, reply, sizeof(reply));
         if (nbytes < 9) continue;
 
@@ -659,33 +864,126 @@ static void lora_tick(void)
         uint16_t crc_recv = (uint16_t)(reply[nbytes - 2] | ((uint16_t)reply[nbytes - 1] << 8));
         if (crc_calc != crc_recv) continue;
 
-        /* Step 3 ACK layout: originator(1) | final_dest(1) | prev_hop(1) |
-         * next_hop(1) | type/ttl(1) | pkt_id(2) | crc(2). Same 9 bytes total
-         * as the old reply, completely different field layout. */
-        uint8_t  ack_originator = reply[0];
-        uint8_t  ack_type       = (reply[4] >> 4) & 0x0F;
-        uint16_t ack_pkt_id;
-        memcpy(&ack_pkt_id, &reply[5], 2);
-        if (ack_originator != LORA_ADDRESS) continue;
-        if (ack_pkt_id     != g_pkt_id)     continue;
+        uint8_t  rx_originator = reply[0];
+        uint8_t  rx_final_dest = reply[1];
+        uint8_t  rx_prev_hop   = reply[2];
+        uint8_t  rx_type       = (reply[4] >> 4) & 0x0F;
+        uint8_t  rx_ttl        =  reply[4] & 0x0F;
+        uint16_t rx_pkt_id;
+        memcpy(&rx_pkt_id, &reply[5], 2);
 
-        if (ack_type == PKT_TYPE_ACK) {
-            g_pkt_id++;
-            g_tx_last_ok = 1;
-            g_tx_state   = LORA_TX_IDLE;
-            return;
+        if (rx_type == PKT_TYPE_DATA) {
+            /* DATA addressed to us at the LoRa layer. final_dest == us means
+             * we'd be the destination — only the hub is in that role; nodes
+             * just drop. */
+            if (rx_final_dest == LORA_ADDRESS) continue;
+
+            /* Don't relay our own packets back to ourselves if another node
+             * forwarded a copy that loops back. */
+            if (rx_originator == LORA_ADDRESS) continue;
+
+            fwd_entry_t *entry = fwd_lookup(rx_originator, rx_pkt_id);
+
+            /* Already confirmed end-to-end — the downstream ACK must have been
+             * lost. Regenerate it locally and ship it back. */
+            if (entry && entry->state == FWD_STATE_CONFIRMED) {
+                send_link_ack(rx_originator, rx_pkt_id, entry->prev_hop);
+                continue;
+            }
+
+            /* In-flight forward for this same packet — drop the dup, our
+             * current forward will resolve and ack the downstream then. */
+            if (entry && entry->state == FWD_STATE_PENDING) continue;
+
+            if (rx_ttl == 0) continue;
+
+            /* Cooperative relay: count direct broadcasts from the originator
+             * (rx_prev_hop == rx_originator). If the originator can reach
+             * the hub directly, hub ACKs on first transmission and we never
+             * see a retry — so we sit idle in OBSERVED and add no traffic.
+             * Only after RELAY_HEARD_THRESHOLD hearings do we conclude the
+             * originator is stuck (out of range, RF too weak) and step in
+             * to forward on its behalf. Forwarded copies (prev_hop !=
+             * originator) don't drive the count — we don't want to pile on
+             * after another node has already relayed. */
+            if (rx_prev_hop == rx_originator) {
+                entry = fwd_observe(rx_originator, rx_pkt_id, rx_prev_hop);
+            }
+            if (!entry || entry->heard_count < RELAY_HEARD_THRESHOLD) continue;
+
+            if (g_tx_state != LORA_TX_IDLE) continue;  /* slot busy, drop */
+
+            /* Threshold reached — promote OBSERVED -> PENDING and relay. */
+            entry->state = FWD_STATE_PENDING;
+
+            /* Rewrite header in place: prev_hop = me, next_hop = parent, TTL--. */
+            reply[2] = (uint8_t)LORA_ADDRESS;
+            reply[3] = (uint8_t)MY_PARENT_ADDRESS;
+            reply[4] = (uint8_t)((PKT_TYPE_DATA << 4) | ((rx_ttl - 1u) & 0x0F));
+
+            uint16_t new_crc = crc16_ccitt(reply, (uint16_t)(nbytes - 2));
+            reply[nbytes - 2] = (uint8_t)(new_crc & 0xFF);
+            reply[nbytes - 1] = (uint8_t)(new_crc >> 8);
+
+            char fwd_hex[64];
+            bytes_to_hex_str(reply, nbytes, fwd_hex);
+            lora_send_begin(fwd_hex, nbytes, MY_PARENT_ADDRESS,
+                            rx_originator, rx_pkt_id, 0u);
+            continue;
         }
-        if (ack_type == PKT_TYPE_NACK) {
+
+        if (rx_type == PKT_TYPE_ACK || rx_type == PKT_TYPE_NACK) {
+            uint8_t matches_pending = (g_tx_state == LORA_TX_WAIT_ACK)
+                                   && (rx_originator == g_tx_originator)
+                                   && (rx_pkt_id     == g_tx_pkt_id);
+
+            if (!matches_pending) continue;   /* not for our pending send — drop */
+
+            if (rx_type == PKT_TYPE_ACK) {
+                if (g_tx_is_own) {
+                    g_pkt_id++;                /* advance our own counter */
+                }
+                g_tx_last_ok = 1;
+                g_tx_state   = LORA_TX_IDLE;
+
+                /* If we were forwarding for someone, mark the entry confirmed
+                 * and send the downstream ACK locally. Subsequent dup DATA
+                 * for this (originator, pkt_id) will trigger a re-send. */
+                if (!g_tx_is_own) {
+                    fwd_entry_t *entry = fwd_lookup(rx_originator, rx_pkt_id);
+                    if (entry) {
+                        entry->state = FWD_STATE_CONFIRMED;
+                        send_link_ack(rx_originator, rx_pkt_id, entry->prev_hop);
+                    }
+                }
+                return;
+            }
+
+            /* NACK matching pending. */
             g_tx_attempt++;
             if (g_tx_attempt >= LORA_MAX_RETRIES) {
                 g_tx_last_ok = 0;
                 g_tx_state   = LORA_TX_IDLE;
+                /* Own send: advance pkt_id so a lost downstream ACK doesn't
+                 * strand us on the same pkt_id forever. The hub may have
+                 * already received and inserted this packet — we just lost
+                 * the ACK chain. Accept the bookkeeping mismatch, move on. */
+                if (g_tx_is_own) {
+                    g_pkt_id++;
+                }
+                /* Forward gave up — drop cache entry so a future retransmit
+                 * can try fresh instead of being stonewalled forever. */
+                if (!g_tx_is_own) {
+                    fwd_remove(g_tx_originator, g_tx_pkt_id);
+                }
             } else {
                 g_tx_t0    = HAL_GetTick();
                 g_tx_state = LORA_TX_BACKOFF;
             }
             return;
         }
+
+        /* Other packet types (BEACON in Step 5) — ignore. */
     }
 
     /* timing-driven transitions */
@@ -699,6 +997,14 @@ static void lora_tick(void)
             if (g_tx_attempt >= LORA_MAX_RETRIES) {
                 g_tx_last_ok = 0;
                 g_tx_state   = LORA_TX_IDLE;
+                /* Own send: advance pkt_id on timeout-driven give-up too. */
+                if (g_tx_is_own) {
+                    g_pkt_id++;
+                }
+                /* Same cleanup on timeout-driven give-up. */
+                if (!g_tx_is_own) {
+                    fwd_remove(g_tx_originator, g_tx_pkt_id);
+                }
             } else {
                 g_tx_t0    = HAL_GetTick();
                 g_tx_state = LORA_TX_BACKOFF;
@@ -720,7 +1026,7 @@ static void send_location_packet(void)
     pkt[0] = (uint8_t)LORA_ADDRESS;        /* originator */
     pkt[1] = (uint8_t)LORA_DEST_ADDRESS;   /* final_dest */
     pkt[2] = (uint8_t)LORA_ADDRESS;        /* prev_hop   */
-    pkt[3] = (uint8_t)LORA_DEST_ADDRESS;   /* next_hop   */
+    pkt[3] = (uint8_t)MY_PARENT_ADDRESS;   /* next_hop   */
     pkt[4] = (uint8_t)((PKT_TYPE_DATA << 4) | (LORA_INITIAL_TTL & 0x0F));
     memcpy(&pkt[5],  &g_pkt_id, 2);
     memcpy(&pkt[7],  &lon_i,    4);
@@ -730,7 +1036,7 @@ static void send_location_packet(void)
     pkt[16] = (uint8_t)(crc >> 8);
 
     bytes_to_hex_str(pkt, 17, hex);
-    lora_send_begin(hex, 17);
+    lora_send_begin(hex, 17, MY_PARENT_ADDRESS, LORA_ADDRESS, g_pkt_id, 1u);
 }
 
 /* Pack and transmit a BASE sensor packet (22 bytes). */
@@ -749,7 +1055,7 @@ static void send_base_packet(float temp_c, float hum_rh, float press_hpa,
     pkt[0]  = (uint8_t)LORA_ADDRESS;        /* originator */
     pkt[1]  = (uint8_t)LORA_DEST_ADDRESS;   /* final_dest */
     pkt[2]  = (uint8_t)LORA_ADDRESS;        /* prev_hop   */
-    pkt[3]  = (uint8_t)LORA_DEST_ADDRESS;   /* next_hop   */
+    pkt[3]  = (uint8_t)MY_PARENT_ADDRESS;   /* next_hop   */
     pkt[4]  = (uint8_t)((PKT_TYPE_DATA << 4) | (LORA_INITIAL_TTL & 0x0F));
     memcpy(&pkt[5],  &g_pkt_id, 2);
     memcpy(&pkt[7],  &temp_i,   2);
@@ -763,7 +1069,7 @@ static void send_base_packet(float temp_c, float hum_rh, float press_hpa,
     pkt[25] = (uint8_t)(crc >> 8);
 
     bytes_to_hex_str(pkt, 26, hex);
-    lora_send_begin(hex, 26);
+    lora_send_begin(hex, 26, MY_PARENT_ADDRESS, LORA_ADDRESS, g_pkt_id, 1u);
 }
 
 /* ======== clock ======== */
@@ -864,6 +1170,12 @@ int main(void)
     g_gas_ready = gas_init_co_only();
     g_s88_ready = s88_init();
 
+    /* Per-node boot stagger: spread send timings across the 10 s window so
+     * leaves' transmissions don't collide with the forwarder's own sends.
+     * Address-based and deterministic — no RNG needed.
+     * Node 1: 0 ms, Node 2: 3000 ms, Node 3: 6000 ms. */
+    HAL_Delay((LORA_ADDRESS - 1u) * 3000u);
+
     /* ---- main loop ---- */
     uint32_t last_send     = HAL_GetTick();
     uint32_t last_location = HAL_GetTick();
@@ -916,3 +1228,4 @@ void assert_failed(uint8_t *file, uint32_t line)
     /* USER CODE END 6 */
 }
 #endif
+//the end :)

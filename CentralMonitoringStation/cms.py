@@ -151,7 +151,7 @@ class CentralMonitoringStation:
     def print_telemetry_base(self, data: Dict[str, Any], pck_info: Dict[str, Any], meta: Dict[str, Any], duplicate: bool = False) -> None:
         tag = "  [DUPLICATE — ACK only]" if duplicate else ""
         print("─" * 52)
-        print(f"  Node     {pck_info['originator']}   pkt_id={pck_info['pkt_id']}{tag}")
+        print(f"  Node     {pck_info['originator']} via {pck_info['prev_hop']}   pkt_id={pck_info['pkt_id']}{tag}")
         print(f"  Temp     {data['Temperature']:.2f} °C")
         print(f"  Humidity {data['Humidity']:.2f} %RH")
         print(f"  Pressure {data['Pressure']:.2f} hPa")
@@ -162,37 +162,38 @@ class CentralMonitoringStation:
             print(f"  RSSI     {meta['rssi']} dBm   SNR {meta['snr']} dB")
         print("─" * 52)
 
-    def print_telemetry_location(self, data: Dict[str, Any], pck_info: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    def print_telemetry_location(self, data: Dict[str, Any], pck_info: Dict[str, Any], meta: Dict[str, Any], duplicate: bool = False) -> None:
+        tag = "  [DUPLICATE — ACK only]" if duplicate else ""
         print("─" * 52)
-        print(f"  Node     {pck_info['originator']}   pkt_id={pck_info['pkt_id']}  [LOCATION]")
+        print(f"  Node     {pck_info['originator']} via {pck_info['prev_hop']}   pkt_id={pck_info['pkt_id']}  [LOCATION]{tag}")
         print(f"  Lon      {data['Long']:.5f}")
         print(f"  Lat      {data['Lat']:.5f}")
         if meta.get("rssi") is not None:
             print(f"  RSSI     {meta['rssi']} dBm   SNR {meta['snr']} dB")
         print("─" * 52)
 
-    def reply_to_sender(self, ser: serial.Serial, originator: int, pkt_id: int, pck_type: int) -> None:
+    def reply_to_sender(self, ser: serial.Serial, originator: int, prev_hop: int, pkt_id: int, pck_type: int) -> None:
         """Send an ACK or NACK back toward the originator of a DATA packet.
-        Step 3 layout: 7-byte header + 2-byte CRC = 9 bytes (same total size
-        as the old reply, totally different fields). The (originator, pkt_id)
-        pair matches the DATA packet being acknowledged so Step 4 forwarders
-        can use it as a cache key when reverse-path routing the ACK.
+        Step 4: the ACK's first hop is whoever delivered the DATA to us
+        (prev_hop), not the originator. In single-hop these are equal; in
+        mesh they diverge, and the forwarder uses its (originator, pkt_id)
+        cache to relay the ACK the rest of the way.
         pck_type must be PKT_TYPE_ACK (0x02) or PKT_TYPE_NACK (0x03).
         """
         type_ttl = ((pck_type & 0x0F) << 4) | (self.INITIAL_TTL & 0x0F)
         header = struct.pack(
             "<B B B B B H",
             originator,   # originator (of the DATA flow being acked)
-            originator,   # final_dest (= originator, ACK goes back to source)
+            originator,   # final_dest (= originator)
             self.ID,      # prev_hop   (= hub, we just sent it)
-            originator,   # next_hop   (single-hop: deliver directly)
+            prev_hop,     # next_hop   (= neighbor that delivered DATA to us)
             type_ttl,
             pkt_id,
         )
         crc16 = self.crc16_ccitt(header)
         full_payload = header + struct.pack("<H", crc16)
         hex_payload = full_payload.hex()
-        cmd = f"AT+SEND={originator},{len(hex_payload)},{hex_payload}\r\n"
+        cmd = f"AT+SEND={prev_hop},{len(hex_payload)},{hex_payload}\r\n"
         ser.write(cmd.encode("utf-8"))
 
     def parse_payload_packed_hex(self, payload_hex: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -423,7 +424,7 @@ class CentralMonitoringStation:
                 is_duplicate = (not self.dry_run) and (last_acc is not None) and (pkt_id == last_acc)
 
                 if pck_info["payload_type"] == "LOCATION":
-                    self.print_telemetry_location(data, pck_info, meta)
+                    self.print_telemetry_location(data, pck_info, meta, duplicate=is_duplicate)
                 else:
                     self.print_telemetry_base(data, pck_info, meta, duplicate=is_duplicate)
 
@@ -431,12 +432,12 @@ class CentralMonitoringStation:
                     continue
 
                 if is_duplicate:
-                    self.reply_to_sender(ser, originator=originator, pkt_id=pkt_id, pck_type=self.PKT_TYPE_ACK)
+                    self.reply_to_sender(ser, originator=originator, prev_hop=pck_info["prev_hop"], pkt_id=pkt_id, pck_type=self.PKT_TYPE_ACK)
                     continue
 
                 self.supabase_insert_row(data)
                 print("  ✓ row inserted")
-                self.reply_to_sender(ser, originator=originator, pkt_id=pkt_id, pck_type=self.PKT_TYPE_ACK)
+                self.reply_to_sender(ser, originator=originator, prev_hop=pck_info["prev_hop"], pkt_id=pkt_id, pck_type=self.PKT_TYPE_ACK)
                 self.last_pkt_id_by_originator[originator] = pkt_id
 
             except KeyboardInterrupt:
@@ -457,7 +458,7 @@ class CentralMonitoringStation:
             except ValueError as e:
                 # Case of bad CRC or LoRa error, reply with NACK
                 print(f"  [NACK] {e}")
-                self.reply_to_sender(ser, originator=pck_info["originator"], pkt_id=pck_info["pkt_id"], pck_type=self.PKT_TYPE_NACK)
+                self.reply_to_sender(ser, originator=pck_info["originator"], prev_hop=pck_info["prev_hop"], pkt_id=pck_info["pkt_id"], pck_type=self.PKT_TYPE_NACK)
                 time.sleep(0.05)
 
             except Exception as e:
